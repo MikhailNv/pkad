@@ -20,7 +20,7 @@
 ## Доступ к БД (только чтение)
 
 ```bash
-export PGPASSWORD='St06#Fc6nW39'
+export PGPASSWORD='<password>'      # пароль из файла задания
 export PGOPTIONS='-c default_transaction_read_only=on'
 psql -h 201.34.158.248 -p 5432 -U student_06 -d practice_06
 ```
@@ -53,7 +53,7 @@ SELECT * FROM core.report_profile_columns();
 Из терминала одной командой:
 
 ```bash
-PGPASSWORD='St06#Fc6nW39' psql -h 201.34.158.248 -p 5432 -U student_06 -d practice_06 \
+PGPASSWORD='<password>' psql -h 201.34.158.248 -p 5432 -U student_06 -d practice_06 \
   -c "SELECT * FROM core.report_profile_raw();"
 ```
 
