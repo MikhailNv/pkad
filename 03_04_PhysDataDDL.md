@@ -14,52 +14,216 @@
 ```mermaid
 erDiagram
     CITY {
-        smallint city_id PK
-        text     city_name UK
-    }
-    PERSON {
-        smallint person_id PK
-        text     person_code UK
-        text     last_name
-        text     first_name
-        text     patronymic
-        smallint city_id FK
-    }
-    ROUTE {
-        smallint route_id PK
-        smallint from_city_id FK
-        smallint to_city_id FK
-    }
-    EVENT_STATUS {
-        smallint status_id PK
-        text     status_code UK
-        text     status_name
-        smallint seq_no
-        boolean  is_terminal
-    }
-    SHIPMENT {
-        text     shipment_id PK
-        smallint sender_person_id FK
-        smallint receiver_person_id FK
-        smallint route_id FK
-        smallint courier_person_id FK
-    }
-    SHIPMENT_EVENT {
-        bigint   event_id PK
-        text     shipment_id FK
-        timestamp event_datetime
-        smallint status_id FK
+        smallint  city_id            PK
+        text      city_name          UK
     }
 
-    CITY      ||--o{ PERSON         : "место жительства"
-    CITY      ||--o{ ROUTE          : "откуда"
-    CITY      ||--o{ ROUTE          : "куда"
-    PERSON    ||--o{ SHIPMENT       : "отправитель"
-    PERSON    ||--o{ SHIPMENT       : "получатель"
-    PERSON    ||--o{ SHIPMENT       : "назначенный курьер"
-    ROUTE     ||--o{ SHIPMENT       : "направление"
-    SHIPMENT  ||--|{ SHIPMENT_EVENT : "состоит из 5 событий"
+    PERSON {
+        smallint  person_id          PK
+        text      person_code        UK
+        text      last_name
+        text      first_name
+        text      patronymic
+        smallint  city_id            FK
+    }
+
+    ROUTE {
+        smallint  route_id           PK
+        smallint  from_city_id       FK
+        smallint  to_city_id         FK
+    }
+
+    EVENT_STATUS {
+        smallint  status_id          PK
+        text      status_code        UK
+        text      status_name
+        smallint  seq_no
+        boolean   is_terminal
+    }
+
+    SHIPMENT {
+        text      shipment_id        PK
+        smallint  sender_person_id   FK
+        smallint  receiver_person_id FK
+        smallint  route_id           FK
+        smallint  courier_person_id  FK
+    }
+
+    SHIPMENT_EVENT {
+        bigint    event_id           PK
+        text      shipment_id        FK
+        timestamp event_datetime
+        smallint  status_id          FK
+    }
+
+    CITY         ||--o{ PERSON         : "место жительства"
+    CITY         ||--o{ ROUTE          : "откуда"
+    CITY         ||--o{ ROUTE          : "куда"
+    PERSON       ||--o{ SHIPMENT       : "отправитель"
+    PERSON       ||--o{ SHIPMENT       : "получатель"
+    PERSON       ||--o{ SHIPMENT       : "назначенный курьер"
+    ROUTE        ||--o{ SHIPMENT       : "направление"
+    SHIPMENT     ||--|{ SHIPMENT_EVENT : "состоит из 5 событий"
     EVENT_STATUS ||--o{ SHIPMENT_EVENT : "тип события"
+```
+
+Также нам понадобится набор некоторых служебных таблиц из тех же документов с анализом:
+
+* `stg_raw_row` - журнал прибытия, куда будут записываться статусы для прибывающих и пребывающих товаров;
+* `quarantine_row` - изоляция для товаров;
+* `etl_run_log` - отчёт.
+
+Введём ещё две служебные таблицы `event_quality_flag` и `shipment_quality_flag` флаги качества для событий и обозначений аномалий. Для таких данных модель сущность-связь будет выглядеть так:
+
+```mermaid
+erDiagram
+    ETL_RUN_LOG {
+        int       run_id           PK
+        timestamp started_at
+        timestamp finished_at
+        int       rows_read
+        int       rows_duplicated
+        int       rows_quarantined
+        int       rows_loaded
+    }
+
+    STG_RAW_ROW {
+        text      raw_hash         PK
+        int       raw_row_no
+        jsonb     payload
+        text      load_status
+    }
+
+    QUARANTINE_ROW {
+        bigserial quarantine_id    PK
+        text      raw_hash FK
+        text      reason_code
+        text      reason_detail
+        jsonb     payload
+    }
+
+    SHIPMENT_EVENT {
+        bigint    event_id PK
+        text      shipment_id      FK
+    }
+
+    SHIPMENT {
+        text      shipment_id      PK
+    }
+
+    EVENT_QUALITY_FLAG {
+        bigint    event_id         FK
+        text      flag_code
+    }
+
+    SHIPMENT_QUALITY_FLAG {
+        text      shipment_id      FK
+        text      flag_code
+    }
+
+    ETL_RUN_LOG    ||--o{ STG_RAW_ROW           : "обрабатывает в рамках пакета"
+    STG_RAW_ROW    ||--o| QUARANTINE_ROW        : "отклоняется в карантин"
+    STG_RAW_ROW    ||--o| SHIPMENT_EVENT        : "успешно загружается в факт"
+    SHIPMENT_EVENT ||--o{ EVENT_QUALITY_FLAG    : "имеет замечания к событию"
+    SHIPMENT       ||--o{ SHIPMENT_QUALITY_FLAG : "имеет замечания к посылке"
+```
+
+Итого, общая таблица модели сущности-связи, объединяя два предыдущих:
+
+```mermaid
+erDiagram
+    CITY {
+        smallint  city_id            PK
+        text      city_name          UK
+    }
+
+    PERSON {
+        smallint  person_id          PK
+        text      person_code        UK
+        text      last_name
+        text      first_name
+        text      patronymic
+        smallint  city_id            FK
+    }
+
+    ROUTE {
+        smallint  route_id           PK
+        smallint  from_city_id       FK
+        smallint  to_city_id         FK
+    }
+
+    EVENT_STATUS {
+        smallint  status_id          PK
+        text      status_code        UK
+        text      status_name
+        smallint  seq_no
+        boolean   is_terminal
+    }
+
+    SHIPMENT {
+        text      shipment_id        PK
+        smallint  sender_person_id   FK
+        smallint  receiver_person_id FK
+        smallint  route_id           FK
+        smallint  courier_person_id  FK
+    }
+
+    SHIPMENT_EVENT {
+        bigint    event_id           PK
+        text      shipment_id        FK
+        timestamp event_datetime
+        smallint  status_id          FK
+    }
+
+    ETL_RUN_LOG {
+        int       run_id             PK
+        timestamp started_at
+        timestamp finished_at
+        int       rows_read
+        int       rows_duplicated
+        int       rows_quarantined
+        int       rows_loaded
+    }
+
+    STG_RAW_ROW {
+        text      raw_hash           PK
+        int       raw_row_no
+        jsonb     payload
+        text      load_status
+    }
+
+    QUARANTINE_ROW {
+        bigserial quarantine_id      PK
+        text      raw_hash FK
+        text      reason_code
+        text      reason_detail
+        jsonb     payload
+    }
+
+    EVENT_QUALITY_FLAG {
+        bigint    event_id           FK
+        text      flag_code
+    }
+
+    SHIPMENT_QUALITY_FLAG {
+        text      shipment_id        FK
+        text      flag_code
+    }
+
+    CITY           ||--o{ PERSON                : "место жительства"
+    CITY           ||--o{ ROUTE                 : "откуда"
+    CITY           ||--o{ ROUTE                 : "куда"
+    PERSON         ||--o{ SHIPMENT              : "отправитель"
+    PERSON         ||--o{ SHIPMENT              : "получатель"
+    PERSON         ||--o{ SHIPMENT              : "назначенный курьер"
+    ROUTE          ||--o{ SHIPMENT              : "направление"
+    SHIPMENT       ||--|{ SHIPMENT_EVENT        : "состоит из 5 событий"
+    EVENT_STATUS   ||--o{ SHIPMENT_EVENT        : "тип события"
+    ETL_RUN_LOG    ||--o{ STG_RAW_ROW           : "обрабатывает в рамках пакета"
+    STG_RAW_ROW    ||--o| QUARANTINE_ROW        : "отклоняется в карантин"
+    STG_RAW_ROW    ||--o| SHIPMENT_EVENT        : "успешно загружается в факт"
+    SHIPMENT_EVENT ||--o{ EVENT_QUALITY_FLAG    : "имеет замечания к событию"
+    SHIPMENT       ||--o{ SHIPMENT_QUALITY_FLAG : "имеет замечания к посылке"
 ```
 
 Преобразования доменов:
@@ -83,68 +247,4 @@ erDiagram
 
 Вторая часть предполагает описание полученной [целевой модели](#физическая-модель) в схеме `core`. Поскольку физическая модель построена на модели сущности-связи, для которой были решены проблемы с составными полями и повторяющимися сущностями (приведена к 2-ой или 3-ей нормальной форме, если более формально), то задача это части сводится к простому написанию SQL кода, который бы создавал необходимые таблицы и связи.
 
-```sql
--- Схема 'core'.
-CREATE SCHEMA IF NOT EXISTS core;
-
--- Таблица 'Cities' в схеме 'core'.
-CREATE TABLE core.Cities (
-    CityId SMALLINT PRIMARY KEY NOT NULL,
-    CityName VARCHAR(32) NOT NULL UNIQUE -- UNIQUE (K1)
-);
-
--- Таблица 'EventStatuses' в схеме 'core'.
-CREATE TABLE core.EventStatuses (
-    EventStatusId SMALLINT PRIMARY KEY NOT NULL,
-    EventStatusCode VARCHAR(32) NOT NULL UNIQUE, -- UNIQUE (K4)
-    EventStatusName VARCHAR(32) NOT NULL UNIQUE, -- UNIQUE (K5)
-    EventStatusSeqNo SMALLINT NOT NULL UNIQUE, -- UNIQUE (K7)
-    EventStatusIsTerminal BOOLEAN NOT NULL
-);
-
--- Таблица 'Persons' в схеме 'core'.
-CREATE TABLE core.Persons (
-    PersonId INT PRIMARY KEY NOT NULL,
-    PersonCode CHAR(3) NOT NULL UNIQUE, -- UNIQUE (K2)
-    PersonLastName VARCHAR(32) NOT NULL,
-    PersonFirstName VARCHAR(32) NOT NULL,
-    PersonPatronymic VARCHAR(32),
-    PersonCityId SMALLINT NOT NULL,
-    CONSTRAINT Persons_K1 UNIQUE (PersonLastName, PersonFirstName), -- UNIQUE (K8)
-    CONSTRAINT Persons_FK1 FOREIGN KEY (PersonCityId) REFERENCES core.Cities (CityId) -- FK1
-);
-
--- Таблица 'Routes' в схеме 'core'.
-CREATE TABLE core.Routes (
-    RouteId INT PRIMARY KEY NOT NULL,
-    RouteFromCityId SMALLINT NOT NULL,
-    RouteToCityId SMALLINT NOT NULL,
-    CONSTRAINT Routes_K1 UNIQUE (RouteFromCityId, RouteToCityId), -- UNIQUE (K3)
-    CONSTRAINT Routes_FK1 FOREIGN KEY (RouteFromCityId) REFERENCES core.Cities (CityId), -- FK2
-    CONSTRAINT Routes_FK2 FOREIGN KEY (RouteToCityId) REFERENCES core.Cities (CityId) -- FK3
-);
-
--- Таблица 'Shipments' в схеме 'core'.
-CREATE TABLE core.Shipments (
-    ShipmentId CHAR(9) PRIMARY KEY NOT NULL,
-    ShipmentSenderPersonId INT NOT NULL,
-    ShipmentReceiverPersonId INT NOT NULL,
-    ShipmentCourierPersonId INT,
-    ShipmentRouteId INT NOT NULL,
-    CONSTRAINT Shipments_FK1 FOREIGN KEY (ShipmentSenderPersonId) REFERENCES core.Persons (PersonId), -- FK4
-    CONSTRAINT Shipments_FK2 FOREIGN KEY (ShipmentReceiverPersonId) REFERENCES core.Persons (PersonId), -- FK5
-    CONSTRAINT Shipments_FK3 FOREIGN KEY (ShipmentCourierPersonId) REFERENCES core.Persons (PersonId), -- FK6
-    CONSTRAINT Shipments_FK4 FOREIGN KEY (ShipmentRouteId) REFERENCES core.Routes (RouteId) -- FK7
-);
-
--- Таблица 'ShipmentEvents' в схеме 'core'.
-CREATE TABLE core.ShipmentEvents (
-    ShipmentEventId BIGINT PRIMARY KEY NOT NULL,
-    ShipmentEventShipmentId CHAR(9) NOT NULL,
-    ShipmentEventDatetime TIMESTAMP NOT NULL,
-    ShipmentEventEventStatusId SMALLINT NOT NULL,
-    CONSTRAINT ShipmentEvents_K1 UNIQUE (ShipmentEventShipmentId, ShipmentEventDatetime, ShipmentEventEventStatusId), -- UNIQUE (K6)
-    CONSTRAINT ShipmentEvents_FK1 FOREIGN KEY (ShipmentEventShipmentId) REFERENCES core.Shipments (ShipmentId), -- FK8
-    CONSTRAINT ShipmentEvents_FK2 FOREIGN KEY (ShipmentEventEventStatusId) REFERENCES core.EventStatuses (EventStatusId) -- FK9
-);
-```
+Набор SQL запросов для создания основных таблиц (по запросу коллег все названия, в отличие от физической модели выше приведены к `snake_case` и к названиям из модели сущности-связи) описан в файле [`Task3.sql`](./Task3.sql).
