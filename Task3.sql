@@ -31,7 +31,7 @@ CREATE TABLE core.etl_run_log (
 CREATE TABLE core.stg_raw_row (
     raw_hash CHAR(32) PRIMARY KEY NOT NULL, -- StgRawRows.StgRawRowRawHash
     raw_row_no INT NOT NULL, -- StgRawRows.StgRawRowRawRowNo
-    payload BLOB NOT NULL, -- StgRawRows.StgRawRowPayload
+    payload jsonb NOT NULL, -- StgRawRows.StgRawRowPayload
     load_status VARCHAR(32) NOT NULL, -- StgRawRows.StgRawRowLoadStatus
     run_log_id INT NOT NULL, -- StgRawRows.StgRawRowEtlRunLogId
     CONSTRAINT stg_raw_row_FK1 FOREIGN KEY (run_log_id) REFERENCES core.etl_run_log (run_id) -- FK10
@@ -43,7 +43,7 @@ CREATE TABLE core.quarantine_row (
     raw_hash CHAR(32) NOT NULL, -- QuarantineRows.QuarantineRowStgRawRowRawHash
     reason_code CHAR(32) NOT NULL, -- QuarantineRows.QuarantineRowReasonCode
     reason_detail VARCHAR(256), -- QuarantineRows.QuarantineRowReasonDetail
-    payload BLOB NOT NULL, -- QuarantineRows.QuarantineRowPayload
+    payload jsonb NOT NULL, -- QuarantineRows.QuarantineRowPayload
     CONSTRAINT quarantine_row_FK1 FOREIGN KEY (raw_hash) REFERENCES core.stg_raw_row (raw_hash) -- FK11
 );
 
@@ -71,7 +71,7 @@ CREATE TABLE core.route (
 
 -- Таблица 'Shipments' в схеме 'core'.
 CREATE TABLE core.shipment (
-    shipment_id CHAR(9) PRIMARY KEY NOT NULL, -- Shipments.ShipmentId
+    shipment_id CHAR(10) PRIMARY KEY NOT NULL, -- Shipments.ShipmentId
     sender_person_id INT NOT NULL, -- Shipments.ShipmentSenderPersonId
     receiver_person_id INT NOT NULL, -- Shipments.ShipmentReceiverPersonId
     courier_person_id INT, -- Shipments.ShipmentCourierPersonId
@@ -84,7 +84,7 @@ CREATE TABLE core.shipment (
 
 -- Таблица 'ShipmentQualityFlags' в схеме 'core'.
 CREATE TABLE core.shipment_quality_flag (
-    shipment_id CHAR(9) NOT NULL, -- ShipmentQualityFlags.ShipmentQualityFlagShipmentId
+    shipment_id CHAR(10) NOT NULL, -- ShipmentQualityFlags.ShipmentQualityFlagShipmentId
     flag_code CHAR(32) NOT NULL, -- ShipmentQualityFlags.ShipmentQualityFlagCode
     CONSTRAINT shipment_quality_flag_PK PRIMARY KEY (shipment_id, flag_code), -- PRIMARY KEY
     CONSTRAINT shipment_quality_flag_FK1 FOREIGN KEY (shipment_id) REFERENCES core.shipment (shipment_id) -- FK12
@@ -93,14 +93,14 @@ CREATE TABLE core.shipment_quality_flag (
 -- Таблица 'ShipmentEvents' в схеме 'core'.
 CREATE TABLE core.shipment_event (
     event_id BIGINT PRIMARY KEY NOT NULL, -- ShipmentEvents.ShipmentEventId
-    shipment_id CHAR(9) NOT NULL, -- ShipmentEvents.ShipmentEventShipmentId
+    shipment_id CHAR(10) NOT NULL, -- ShipmentEvents.ShipmentEventShipmentId
     event_datetime TIMESTAMP NOT NULL, -- ShipmentEvents.ShipmentEventDatetime
     status_id SMALLINT NOT NULL, -- ShipmentEvents.ShipmentEventEventStatusId
-    raw_hash CHAR(32), -- ShipmentEvents.ShipmentEventStgRawRowRawHash
+    raw_hash CHAR(34), -- ShipmentEvents.ShipmentEventStgRawRowRawHash
     CONSTRAINT shipment_event_K1 UNIQUE (shipment_id, event_datetime, status_id), -- UNIQUE (K6)
     CONSTRAINT shipment_event_FK1 FOREIGN KEY (shipment_id) REFERENCES core.shipment (shipment_id), -- FK8
     CONSTRAINT shipment_event_FK2 FOREIGN KEY (status_id) REFERENCES core.event_status (status_id), -- FK9
-    CONSTRAINT shipment_event_FK3 FOREIGN KEY (raw_hash) REFERENCES core.stg_raw_row (raw_hash) -- FK14
+    CONSTRAINT shipment_event_FK3 FOREIGN KEY (raw_hash) REFERENCES core.stg_raw_row (raw_row_id) -- FK14
 );
 
 -- Таблица 'EventQualityFlags' в схеме 'core'.
