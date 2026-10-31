@@ -70,15 +70,16 @@ erDiagram
 Также нам понадобится набор некоторых служебных таблиц из тех же документов с анализом:
 
 * `stg_raw_row` - журнал прибытия, куда будут записываться статусы для прибывающих и пребывающих товаров;
+* `stg_event_clean` - журнал событий;
 * `quarantine_row` - изоляция для товаров;
-* `etl_run_log` - отчёт.
-
-Введём ещё две служебные таблицы `event_quality_flag` и `shipment_quality_flag` флаги качества для событий и обозначений аномалий. Для таких данных модель сущность-связь будет выглядеть так:
+* `etl_run_log` - отчёт;
+* `event_quality_flag` - флаг качества для событий;
+* `shipment_quality_flag` - флаг обозначения аномалий.
 
 ```mermaid
 erDiagram
     ETL_RUN_LOG {
-        int       run_id           PK
+        int       run_id             PK
         timestamp started_at
         timestamp finished_at
         int       rows_read
@@ -87,45 +88,77 @@ erDiagram
         int       rows_loaded
     }
 
-    STG_RAW_ROW {
-        text      raw_hash         PK
-        int       raw_row_no
-        jsonb     payload
-        text      load_status
+    STG_EVENT_CLEAN {
+        text      raw_row_id         FK
+        bool      is_exact_duplicate
+        text      duplicate_of
+        timestamp event_ts
+        text      status_code
+        int       status_seq
+        int       sender_no
+        text      sender_city
+        int       receiver_no
+        text      receiver_city
+        int       courier_no
+        text      route_from
+        text      route_to
     }
 
-    QUARANTINE_ROW {
-        bigserial quarantine_id    PK
-        text      raw_hash FK
-        text      reason_code
+    STG_RAW_ROW {
+        text      raw_row_id         PK
+        text      raw_hash
+        int       occurrence
+        bool      is_exact_duplicate
+        text      shipment_id
+        text      event_datetime
+        text      sender_info
+        text      route_info
+        text      courier_info
+        text      status_info
+    }
+
+    QUARANTINE {
+        text      raw_row_id         PK
+        text      source_table
+        text      primary_reason
+        text      reason_codes
         text      reason_detail
         jsonb     payload
+        jsonb     suggested_fix
+        bool      is_active
+        timestamp first_detected_at
+        text      resolution_status
+        text      resolution_comment
+        timestamp resolved_at
+        timestamp deactivated_at
     }
 
     SHIPMENT_EVENT {
-        bigint    event_id PK
-        text      shipment_id      FK
+        bigint    event_id           PK
+        text      shipment_id        FK
+        timestamp event_datetime
+        int       status_id          FK
+        text      raw_hash           FK
     }
 
     SHIPMENT {
-        text      shipment_id      PK
+        text      shipment_id        PK
     }
 
     EVENT_QUALITY_FLAG {
-        bigint    event_id         FK
+        bigint    event_id           FK
         text      flag_code
     }
 
     SHIPMENT_QUALITY_FLAG {
-        text      shipment_id      FK
+        text      shipment_id        FK
         text      flag_code
     }
 
-    ETL_RUN_LOG    ||--o{ STG_RAW_ROW           : "обрабатывает в рамках пакета"
-    STG_RAW_ROW    ||--o| QUARANTINE_ROW        : "отклоняется в карантин"
-    STG_RAW_ROW    ||--o| SHIPMENT_EVENT        : "успешно загружается в факт"
-    SHIPMENT_EVENT ||--o{ EVENT_QUALITY_FLAG    : "имеет замечания к событию"
-    SHIPMENT       ||--o{ SHIPMENT_QUALITY_FLAG : "имеет замечания к посылке"
+    STG_RAW_ROW    ||--o| STG_EVENT_CLEAN       : ""
+    STG_RAW_ROW    ||--o| SHIPMENT_EVENT        : ""
+    SHIPMENT_EVENT ||--o{ EVENT_QUALITY_FLAG    : ""
+    SHIPMENT       ||--o{ SHIPMENT_QUALITY_FLAG : ""
 ```
 
 Итого, общая таблица модели сущности-связи, объединяя два предыдущих:
@@ -185,19 +218,49 @@ erDiagram
         int       rows_loaded
     }
 
-    STG_RAW_ROW {
-        text      raw_hash           PK
-        int       raw_row_no
-        jsonb     payload
-        text      load_status
+    STG_EVENT_CLEAN {
+        text      raw_row_id         FK
+        bool      is_exact_duplicate
+        text      duplicate_of
+        timestamp event_ts
+        text      status_code
+        int       status_seq
+        int       sender_no
+        text      sender_city
+        int       receiver_no
+        text      receiver_city
+        int       courier_no
+        text      route_from
+        text      route_to
     }
 
-    QUARANTINE_ROW {
-        bigserial quarantine_id      PK
-        text      raw_hash FK
-        text      reason_code
+    STG_RAW_ROW {
+        text      raw_row_id         PK
+        text      raw_hash
+        int       occurrence
+        bool      is_exact_duplicate
+        text      shipment_id
+        text      event_datetime
+        text      sender_info
+        text      route_info
+        text      courier_info
+        text      status_info
+    }
+
+    QUARANTINE {
+        text      raw_row_id         PK
+        text      source_table
+        text      primary_reason
+        text      reason_codes
         text      reason_detail
         jsonb     payload
+        jsonb     suggested_fix
+        bool      is_active
+        timestamp first_detected_at
+        text      resolution_status
+        text      resolution_comment
+        timestamp resolved_at
+        timestamp deactivated_at
     }
 
     EVENT_QUALITY_FLAG {
@@ -210,27 +273,25 @@ erDiagram
         text      flag_code
     }
 
-    CITY           ||--o{ PERSON                : "место жительства"
-    CITY           ||--o{ ROUTE                 : "откуда"
-    CITY           ||--o{ ROUTE                 : "куда"
-    PERSON         ||--o{ SHIPMENT              : "отправитель"
-    PERSON         ||--o{ SHIPMENT              : "получатель"
-    PERSON         ||--o{ SHIPMENT              : "назначенный курьер"
-    ROUTE          ||--o{ SHIPMENT              : "направление"
-    SHIPMENT       ||--|{ SHIPMENT_EVENT        : "состоит из 5 событий"
-    EVENT_STATUS   ||--o{ SHIPMENT_EVENT        : "тип события"
-    ETL_RUN_LOG    ||--o{ STG_RAW_ROW           : "обрабатывает в рамках пакета"
-    STG_RAW_ROW    ||--o| QUARANTINE_ROW        : "отклоняется в карантин"
-    STG_RAW_ROW    ||--o| SHIPMENT_EVENT        : "успешно загружается в факт"
-    SHIPMENT_EVENT ||--o{ EVENT_QUALITY_FLAG    : "имеет замечания к событию"
-    SHIPMENT       ||--o{ SHIPMENT_QUALITY_FLAG : "имеет замечания к посылке"
+    CITY           ||--o{ PERSON                : ""
+    CITY           ||--o{ ROUTE                 : ""
+    CITY           ||--o{ ROUTE                 : ""
+    PERSON         ||--o{ SHIPMENT              : ""
+    PERSON         ||--o{ SHIPMENT              : ""
+    PERSON         ||--o{ SHIPMENT              : ""
+    ROUTE          ||--o{ SHIPMENT              : ""
+    SHIPMENT       ||--|{ SHIPMENT_EVENT        : ""
+    EVENT_STATUS   ||--o{ SHIPMENT_EVENT        : ""
+    STG_RAW_ROW    ||--o| STG_EVENT_CLEAN       : ""
+    STG_RAW_ROW    ||--o| SHIPMENT_EVENT        : ""
+    SHIPMENT_EVENT ||--o{ EVENT_QUALITY_FLAG    : ""
+    SHIPMENT       ||--o{ SHIPMENT_QUALITY_FLAG : ""
 ```
 
 Преобразования доменов:
 
 * для основных идентификаторов было принято использовать стандартный тип `INT`;
 * для таблицы с городами (**CITY** -> **Cities**) выбран стандартный тип `SMALLINT`, из-за размерностей и реального количества городов;
-* для некоторых идентификаторов-кодов был выбран тип `CHAR(...)`, который устанавливает статический размер строки в БД, - здесь следует смотреть на [п. 4 анализа](./02_модель_и_правила.md#4-словарь-данных-атрибуты-типы-ключи-ограничения);
 * для тех мест, где можно было бы выбрать стандартный тип `TINYINT` был выбран `SMALLINT`, из-за того, что некоторые реализации БД *не поддерживают* `TINYINT`.
 
 Соответствующая физическая модель:
