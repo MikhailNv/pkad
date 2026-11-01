@@ -180,6 +180,43 @@ COMMIT;
 ```
 
 
+## 2. Pipeline
+
+Добавлена функция core.run_pipeline() по последовательному запуску шагов
+
+| Шаг | Функция\Процедура | Что делает |
+| :--- | :--- | :--- |
+| 1 | `core.step_02_stage_raw()` | снимок RAW со стабильным `raw_row_id`, точные дубли |
+| 2 | `core.step_04_clean_events()` | разбор полей, проверки уровня записи и посылки, итог строки |
+| 3 | `core.step_05_quarantine()` | карантин и итог по каждой строке RAW |
+| 1 | `core.step_06_load_in_core` | Записывает даныне в целевые таблицы |
+
+```sql
+--SELECT * FROM core.run_pipeline();
+
+CREATE OR REPLACE FUNCTION core.run_pipeline(
+    OUT raw_rows    integer,
+    OUT clean_rows  integer,
+    OUT quarantined integer
+)
+RETURNS record
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    -- Не допускаем параллельных запусков пайплайна
+    PERFORM pg_advisory_xact_lock(8, 2026);
+
+    raw_rows    := core.step_02_stage_raw();
+    clean_rows  := core.step_04_clean_events();
+    quarantined := core.step_05_quarantine();
+    CALL core.step_06_load_in_core();
+END;
+$function$
+;
+
+```
+
+
 ## Проверка результата
 
 | Показатель | Значение |
@@ -193,14 +230,30 @@ COMMIT;
 
 
 ```sql
-SELECT COUNT(*) FROM core.city;
-SELECT COUNT(*) FROM core.person;
-SELECT COUNT(*) FROM core.route;
-SELECT COUNT(*) FROM core.shipment;
-SELECT COUNT(*) FROM core.shipment_event;
+select 'city', COUNT(*) FROM core.city
+UNION ALL
+select 'person', COUNT(*) FROM core.person
+UNION ALL
+select 'route', COUNT(*) FROM core.route
+UNION ALL
+select 'shipment', COUNT(*) FROM core.shipment
+UNION ALL
+select 'shipment_event', COUNT(*) FROM core.shipment_event;
 ```
+
+Функция core.check_core_counts() сравнивает количество записанное в CORE с другими таблицами.
+
+| pair | core_count | ref\raw_count | equal |
+| --- | --- | --- | --- |
+|core.city vs ref_city|	8|	8|	true|
+|core.person vs ref_person|	20|	20|	true|
+|core.shipment vs raw_data_06 (unique shipment_id)|	2000|	2000|	true|
+|core.route vs raw_data_06 (unique route combinations)|	64|	64|	true|
+|core.shipment_event vs raw_row_outcome (LOAD)|	8727|	8727|	true|
+
 ## Прочее
 
 В core.shipment.shipment_id и core.shipment_event.shipment_id 
 Тип изменен на CHAR(10)
 Количество символов в номер отправления (PKG-XXXXXX) - 10
+
