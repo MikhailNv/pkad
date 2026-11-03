@@ -1,16 +1,8 @@
--- =====================================================================
--- Этап 10. Контрольные аналитические запросы к витринам
--- Команда 06 · «Доставка посылок»
---
--- Каждый запрос сохранён в БД как представление core.v_qNN_*:
---   SELECT * FROM core.v_q01_daily_dynamics;
--- Источник — только витрины core.mart_* (RAW повторно не разбирается).
--- Исключение — v_q10_reconciliation: она сверяет витрины с core и с итогами RAW.
--- =====================================================================
+-- Этап 10. Запросы к витринам (core.v_q01…v_q10)
 
 SET search_path = core, public;
 
--- Q01. Как менялся поток посылок по дням? Сколько событий каждого этапа в день.
+-- Q01. Динамика по дням
 CREATE OR REPLACE VIEW core.v_q01_daily_dynamics AS
 SELECT d.event_date,
        sum(d.events) FILTER (WHERE d.status_code = 'CREATED')           AS created,
@@ -25,7 +17,7 @@ SELECT d.event_date,
  GROUP BY d.event_date
  ORDER BY d.event_date;
 
--- Q02. Воронка жизненного цикла: сколько посылок прошли каждый этап и на каком остановились.
+-- Q02. Воронка этапов
 CREATE OR REPLACE VIEW core.v_q02_status_funnel AS
 WITH t AS (SELECT count(*) AS total FROM core.mart_shipment),
 f AS (
@@ -49,7 +41,7 @@ SELECT f.seq_no, f.status_code,
   FROM f CROSS JOIN t
  ORDER BY f.seq_no;
 
--- Q03. Какие маршруты самые загруженные и насколько полно по ним собраны данные?
+-- Q03. Рейтинг маршрутов
 CREATE OR REPLACE VIEW core.v_q03_route_ranking AS
 SELECT dense_rank() OVER (ORDER BY sum(shipments) DESC)            AS rank_by_volume,
        route_name,
@@ -64,7 +56,7 @@ SELECT dense_rank() OVER (ORDER BY sum(shipments) DESC)            AS rank_by_vo
  GROUP BY route_name
  ORDER BY rank_by_volume, route_name;
 
--- Q04. Нагрузка на курьеров: сколько посылок, в сколько дней, сколько городов.
+-- Q04. Нагрузка курьеров
 CREATE OR REPLACE VIEW core.v_q04_courier_load AS
 SELECT dense_rank() OVER (ORDER BY sum(shipments) DESC)            AS rank_by_volume,
        courier_id, courier_name,
@@ -77,7 +69,7 @@ SELECT dense_rank() OVER (ORDER BY sum(shipments) DESC)            AS rank_by_vo
  GROUP BY courier_id, courier_name
  ORDER BY rank_by_volume, courier_id;
 
--- Q05. Потоки по городам: отправлено, получено, внутригородские, сальдо.
+-- Q05. Потоки по городам
 CREATE OR REPLACE VIEW core.v_q05_city_flows AS
 WITH o AS (SELECT from_city AS city, count(*) AS n, count(*) FILTER (WHERE is_same_city) AS inner_n
              FROM core.mart_shipment GROUP BY from_city),
@@ -90,7 +82,7 @@ SELECT coalesce(o.city, i.city)                    AS city,
   FROM o FULL JOIN i ON i.city = o.city
  ORDER BY sent DESC, city;
 
--- Q06. Срок «Создано → Передано курьеру»: распределение.
+-- Q06. Распределение сроков
 CREATE OR REPLACE VIEW core.v_q06_lead_time_distribution AS
 SELECT CASE WHEN lead_time_hours IS NULL THEN 'нет одного из этапов'
             WHEN lead_time_hours <  24   THEN '< 24 ч'
@@ -106,8 +98,7 @@ SELECT CASE WHEN lead_time_hours IS NULL THEN 'нет одного из этап
  GROUP BY 1
  ORDER BY min(lead_time_hours) NULLS LAST;
 
--- Q07. Где «застряли» посылки, не дошедшие до курьера (по последнему загруженному этапу)
---      и сколько часов прошло с последнего события до конца периода данных.
+-- Q07. Застрявшие посылки
 CREATE OR REPLACE VIEW core.v_q07_stuck_shipments AS
 WITH p AS (SELECT max(last_event_at) AS period_end FROM core.mart_shipment)
 SELECT s.last_status_seq, s.last_status_code, s.last_status_name,
@@ -119,7 +110,7 @@ SELECT s.last_status_seq, s.last_status_code, s.last_status_name,
  GROUP BY s.last_status_seq, s.last_status_code, s.last_status_name
  ORDER BY s.last_status_seq;
 
--- Q08. Качество данных по маршрутам: доля неполных цепочек, посылок без курьера, строк в карантине.
+-- Q08. Качество по маршрутам
 CREATE OR REPLACE VIEW core.v_q08_quality_by_route AS
 SELECT route_name,
        count(*)                                                         AS shipments,
@@ -133,7 +124,7 @@ SELECT route_name,
  GROUP BY route_name
  ORDER BY pct_quarantined_rows DESC, route_name;
 
--- Q09. Самые активные отправители: сколько посылок, скольким получателям, в какие города.
+-- Q09. Топ отправителей
 CREATE OR REPLACE VIEW core.v_q09_top_senders AS
 SELECT dense_rank() OVER (ORDER BY count(*) DESC)  AS rank_by_volume,
        sender_id, sender_name, sender_city,
@@ -145,7 +136,7 @@ SELECT dense_rank() OVER (ORDER BY count(*) DESC)  AS rank_by_volume,
  GROUP BY sender_id, sender_name, sender_city
  ORDER BY rank_by_volume, sender_id;
 
--- Q10. Контроль: витрины сходятся с core и с итогами обработки RAW.
+-- Q10. Сверка витрин с core
 CREATE OR REPLACE VIEW core.v_q10_reconciliation AS
 SELECT check_name, mart_value, core_value,
        CASE WHEN check_name LIKE '%≤%' THEN mart_value <= core_value ELSE mart_value = core_value END AS is_ok

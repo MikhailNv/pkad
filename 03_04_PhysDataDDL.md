@@ -69,12 +69,16 @@ erDiagram
 
 Также нам понадобится набор некоторых служебных таблиц из тех же документов с анализом:
 
-* `stg_raw_row` - журнал прибытия, куда будут записываться статусы для прибывающих и пребывающих товаров;
-* `stg_event_clean` - журнал событий;
-* `quarantine_row` - изоляция для товаров;
-* `etl_run_log` - отчёт;
-* `event_quality_flag` - флаг качества для событий;
-* `shipment_quality_flag` - флаг обозначения аномалий.
+* `stg_raw_row` — снимок RAW: одна строка = одна строка `public.raw_data_06` со стабильным `raw_row_id` (хеш 7 полей + номер повтора);
+* `stg_event_clean` — разобранные и стандартизованные поля каждой строки RAW, причины карантина и флаги качества;
+* `quarantine` — очередь карантина: исходная строка (`payload`), причины, статус ручной обработки;
+* `raw_row_outcome` — итог каждой строки RAW: LOAD / QUARANTINE / DUPLICATE;
+* `etl_run_log` — журнал запусков pipeline (создаётся в `sql/08_quality_control.sql`);
+* `event_quality_flag` — флаги качества событий;
+* `shipment_quality_flag` — флаги качества посылок.
+
+`shipment_event.raw_hash` хранит `raw_row_id` строки RAW (FK14 → `stg_raw_row.raw_row_id`) и уникален (K9):
+одна строка RAW даёт не больше одного события, точные дубли событий не создают.
 
 ```mermaid
 erDiagram
@@ -138,7 +142,7 @@ erDiagram
         text      shipment_id        FK
         timestamp event_datetime
         int       status_id          FK
-        text      raw_hash           FK
+        text      raw_hash           FK "UNIQUE, = raw_row_id"
     }
 
     SHIPMENT {

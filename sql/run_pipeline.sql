@@ -1,13 +1,15 @@
+-- Оркестратор: SELECT * FROM core.run_pipeline();
 
 SET search_path = core, public;
 
--- обёртка над пересборкой справочников (sql/01_parse_functions.sql)
+-- Шаг 01
 CREATE OR REPLACE FUNCTION core.step_01_build_refs(OUT cities int, OUT persons int, OUT issues int)
 LANGUAGE plpgsql AS $$
 BEGIN
     SELECT b.cities, b.persons, b.issues INTO cities, persons, issues FROM core.fn_build_refs() b;
 END $$;
 
+-- Журнал шагов
 CREATE OR REPLACE FUNCTION core.fn_log_step(p_run_id bigint, p_no int, p_name text, p_result text, p_t0 timestamptz)
 RETURNS void LANGUAGE sql AS $$
     INSERT INTO core.run_step_log (run_id, step_no, step_name, result, seconds)
@@ -15,6 +17,7 @@ RETURNS void LANGUAGE sql AS $$
             round(extract(epoch FROM clock_timestamp() - p_t0)::numeric, 3));
 $$;
 
+-- Меняется тип результата
 DROP FUNCTION IF EXISTS core.run_pipeline();
 
 CREATE FUNCTION core.run_pipeline()
@@ -31,7 +34,7 @@ DECLARE
     v_fail  int;
     v_warn  int;
 BEGIN
-    -- Не допускаем параллельных запусков пайплайна
+    -- Без параллельных запусков
     PERFORM pg_advisory_xact_lock(8, 2026);
 
     INSERT INTO core.etl_run_log (started_at, status, raw_fingerprint)
@@ -47,7 +50,7 @@ BEGIN
     -- 02
     v_t0 := clock_timestamp();
     v_n := core.step_02_stage_raw();
-    ANALYZE core.stg_raw_row;          
+    ANALYZE core.stg_raw_row;           -- ускоряет шаг 03
     PERFORM core.fn_log_step(v_run, 2, 'step_02_stage_raw', format('строк RAW %s', v_n), v_t0);
 
     -- 03
@@ -66,7 +69,7 @@ BEGIN
     CALL core.step_05_load_core();
     SELECT format('посылок %s, событий %s', (SELECT count(*) FROM core.shipment),
                                               (SELECT count(*) FROM core.shipment_event))
-    INTO v_res;
+      INTO v_res;
     PERFORM core.fn_log_step(v_run, 5, 'step_05_load_core', v_res, v_t0);
 
     -- 06
@@ -82,7 +85,7 @@ BEGIN
     PERFORM core.fn_log_step(v_run, 7, 'step_07_quality_checks',
                              format('ERROR не пройдено %s, WARNING %s', v_fail, v_warn), v_t0);
 
-    -- итог запуска
+    -- Итог запуска
     UPDATE core.etl_run_log l
        SET finished_at      = clock_timestamp(),
            status           = CASE WHEN v_fail = 0 THEN 'SUCCESS' ELSE 'CHECKS_FAILED' END,

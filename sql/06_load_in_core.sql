@@ -1,196 +1,144 @@
+-- Этап 7. Загрузка core — шаг 05
 
--- BEGIN;
--- CALL core.step_06_load_in_core();
--- SELECT COUNT(*) AS loaded_events FROM core.shipment_event;
+SET search_path = core, public;
 
--- COMMIT;
+-- Старое имя шага
+DROP PROCEDURE IF EXISTS core.step_06_load_in_core();
 
-CREATE OR REPLACE PROCEDURE core.step_06_load_in_core()
+-- UNIQUE (K9) для ранее созданных таблиц
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'core.shipment_event'::regclass AND conname = 'shipment_event_k2') THEN
+        ALTER TABLE core.shipment_event ADD CONSTRAINT shipment_event_K2 UNIQUE (raw_hash);
+    END IF;
+END $$;
+
+-- Справочник флагов качества
+CREATE TABLE IF NOT EXISTS core.ref_quality_flag (
+    flag_code   text PRIMARY KEY,
+    flag_level  text NOT NULL CHECK (flag_level IN ('EVENT', 'SHIPMENT')),
+    source      text NOT NULL CHECK (source IN ('STAGE_5', 'CORE')),
+    description text NOT NULL
+);
+
+INSERT INTO core.ref_quality_flag (flag_code, flag_level, source, description) VALUES
+    ('SENDER_EMPTY',                'EVENT',    'STAGE_5', 'В строке не указан отправитель (восстановлен по другим событиям посылки)'),
+    ('RECEIVER_EMPTY',              'EVENT',    'STAGE_5', 'В строке не указан получатель (восстановлен по другим событиям посылки)'),
+    ('COURIER_MISSING_ON_HANDOVER', 'EVENT',    'STAGE_5', 'Событие «Передано курьеру» без курьера'),
+    ('SELF_SHIPMENT',               'SHIPMENT', 'STAGE_5', 'Отправитель и получатель — один и тот же человек'),
+    ('SAME_CITY_DELIVERY',          'SHIPMENT', 'STAGE_5', 'Доставка внутри одного города'),
+    ('NO_COURIER',                  'SHIPMENT', 'CORE',    'Курьер не определён ни по одному загруженному событию'),
+    ('INCOMPLETE_CHAIN',            'SHIPMENT', 'CORE',    'Загружены не все базовые этапы «Создано» … «Передано курьеру» (часть строк в карантине или отсутствует в RAW)')
+ON CONFLICT (flag_code) DO UPDATE
+   SET flag_level = EXCLUDED.flag_level, source = EXCLUDED.source, description = EXCLUDED.description;
+
+-- FK: флаги из справочника
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'core.event_quality_flag'::regclass AND conname = 'event_quality_flag_flag_fk') THEN
+        ALTER TABLE core.event_quality_flag ADD CONSTRAINT event_quality_flag_flag_fk FOREIGN KEY (flag_code) REFERENCES core.ref_quality_flag (flag_code);
+    END IF;
+END $$;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'core.shipment_quality_flag'::regclass AND conname = 'shipment_quality_flag_flag_fk') THEN
+        ALTER TABLE core.shipment_quality_flag ADD CONSTRAINT shipment_quality_flag_flag_fk FOREIGN KEY (flag_code) REFERENCES core.ref_quality_flag (flag_code);
+    END IF;
+END $$;
+
+-- Шаг 05
+CREATE OR REPLACE PROCEDURE core.step_05_load_core()
 LANGUAGE plpgsql
 SET search_path = core, public
 AS $$
 BEGIN
+    -- Полная пересборка
+    TRUNCATE core.event_quality_flag, core.shipment_event, core.shipment_quality_flag,
+             core.shipment, core.route, core.person, core.city, core.event_status;
 
--- 0. Очистка перед загрузкой
-TRUNCATE TABLE core.city RESTART identity CASCADE;
-TRUNCATE TABLE core.person RESTART identity CASCADE;
-TRUNCATE TABLE core.route RESTART identity CASCADE;
-TRUNCATE TABLE core.shipment RESTART identity CASCADE;
-TRUNCATE TABLE core.event_status RESTART identity CASCADE;
-TRUNCATE TABLE core.shipment_event RESTART identity CASCADE;
+    -- Статусы из ref_status
+    INSERT INTO core.event_status (status_id, status_code, status_name, seq_no, is_terminal)
+    SELECT s.seq_no, s.status_code, s.status_name, s.seq_no,
+           s.seq_no = max(s.seq_no) OVER ()
+      FROM core.ref_status s;
 
--- 1. Загрузка в core.city
---    city_id генерируется по порядку: 1, 2, 3, ...
---    Порядок задаём по city_norm (файл уже отсортирован по нему),
---    чтобы нумерация была воспроизводимой.
-INSERT INTO core.city (city_id, city_name)
-SELECT
-    ROW_NUMBER() OVER (ORDER BY s.city_norm)::SMALLINT AS city_id,
-    s.city_name
-FROM core.ref_city s
--- защита от повторной загрузки, если city_name уже есть
-WHERE NOT EXISTS (
-    SELECT 1 FROM core.city c WHERE c.city_name = s.city_name
-);
+    -- Города из ref_city
+    INSERT INTO core.city (city_id, city_name)
+    SELECT row_number() OVER (ORDER BY c.city_norm), c.city_name
+      FROM core.ref_city c;
 
--- 1.1. Контроль
---SELECT city_id, city_name FROM core.city ORDER BY city_id;
+    -- Люди из ref_person, ФИО через initcap
+    INSERT INTO core.person (person_id, person_code, last_name, first_name, patronymic, city_id)
+    SELECT p.person_no,
+           lpad(p.person_no::text, greatest(3, length(p.person_no::text)), '0'),
+           initcap(p.last_name),
+           initcap(p.first_name),
+           initcap(nullif(p.patronymic, '')),
+           c.city_id
+      FROM core.ref_person p
+      JOIN core.city c ON c.city_name = p.city_name;
 
+    -- Маршруты из строк LOAD
+    INSERT INTO core.route (route_id, from_city_id, to_city_id)
+    SELECT row_number() OVER (ORDER BY fc.city_id, tc.city_id), fc.city_id, tc.city_id
+      FROM (SELECT DISTINCT route_from, route_to
+              FROM core.stg_event_clean
+             WHERE outcome = 'LOAD') s
+      JOIN core.city fc ON fc.city_name = s.route_from
+      JOIN core.city tc ON tc.city_name = s.route_to;
 
--- 2. Загрузка в core.person
-INSERT INTO core.person (
-    person_id,
-    person_code,
-    last_name,
-    first_name,
-    patronymic,
-    city_id
-)
-SELECT
-    s.person_no                         AS person_id,
-    LPAD(s.person_no::text, 3, '0')     AS person_code,  -- CHAR(3), например '001'
-    s.last_name,
-    s.first_name,
-    NULLIF(s.patronymic, '')            AS patronymic,   -- пустая строка -> NULL
-    c.city_id
-FROM core.ref_person s
-JOIN core.city c
-  ON c.city_name = s.city_name;
+    -- Посылки из строк LOAD, курьер из любого события
+    INSERT INTO core.shipment (shipment_id, sender_person_id, receiver_person_id, courier_person_id, route_id)
+    SELECT s.shipment_id, s.sender_no, s.receiver_no, s.courier_no, r.route_id
+      FROM (SELECT shipment_id,
+                   max(sender_no)   AS sender_no,
+                   max(receiver_no) AS receiver_no,
+                   max(courier_no)  AS courier_no,
+                   max(route_from)  AS route_from,
+                   max(route_to)    AS route_to
+              FROM core.stg_event_clean
+             WHERE outcome = 'LOAD'
+             GROUP BY shipment_id) s
+      JOIN core.city  fc ON fc.city_name = s.route_from
+      JOIN core.city  tc ON tc.city_name = s.route_to
+      JOIN core.route r  ON r.from_city_id = fc.city_id AND r.to_city_id = tc.city_id
+     WHERE s.sender_no IS NOT NULL
+       AND s.receiver_no IS NOT NULL;
 
--- 2.1. Контроль
---SELECT COUNT(*) AS loaded_rows FROM core.person;
+    -- События: одна строка LOAD = одно событие
+    INSERT INTO core.shipment_event (event_id, shipment_id, event_datetime, status_id, raw_hash)
+    SELECT row_number() OVER (ORDER BY e.shipment_id, e.event_ts, e.status_seq, e.raw_row_id),
+           e.shipment_id, e.event_ts, e.status_seq, e.raw_row_id
+      FROM core.stg_event_clean e
+      JOIN core.shipment sh ON sh.shipment_id = e.shipment_id
+     WHERE e.outcome = 'LOAD';
 
--- 3. Загрузка в core.route
-INSERT INTO core.route (route_id, from_city_id, to_city_id)
-SELECT
-    (COALESCE((SELECT MAX(route_id) FROM core.route), 0)
-     + ROW_NUMBER() OVER (ORDER BY fc.city_id, tc.city_id))::INT AS route_id,
-    fc.city_id AS from_city_id,
-    tc.city_id AS to_city_id
-FROM (
-    SELECT DISTINCT route_from, route_to
-    FROM core.stg_event_clean
-    WHERE route_from IS NOT NULL
-      AND route_to   IS NOT NULL
-) s
-JOIN core.city fc ON fc.city_name = s.route_from
-JOIN core.city tc ON tc.city_name = s.route_to
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM core.route r
-    WHERE r.from_city_id = fc.city_id
-      AND r.to_city_id   = tc.city_id
-);
+    -- Флаги событий
+    INSERT INTO core.event_quality_flag (event_id, flag_code)
+    SELECT DISTINCT ev.event_id, f.flag
+      FROM core.shipment_event ev
+      JOIN core.stg_event_clean e ON e.raw_row_id = ev.raw_hash
+     CROSS JOIN LATERAL unnest(e.flags) AS f(flag)
+      JOIN core.ref_quality_flag q ON q.flag_code = f.flag AND q.flag_level = 'EVENT';
 
--- 3.1. Контроль
---SELECT r.route_id,
---       fc.city_name AS from_city,
---       tc.city_name AS to_city
---FROM core.route r
---JOIN core.city fc ON fc.city_id = r.from_city_id
---JOIN core.city tc ON tc.city_id = r.to_city_id
---ORDER BY r.route_id;
-    
--- 4. Заполнение таблицы core.event_status
-INSERT INTO core.event_status (status_id, status_code, status_name, seq_no, is_terminal)
-VALUES
-    (1, 'CREATED',           'Создано',             1, false),
-    (2, 'ACCEPTED',          'Принято',             2, false),
-    (3, 'SORTING',           'Сортировочный центр', 3, false),
-    (4, 'IN_TRANSIT',        'В пути',              4, false),
-    (5, 'HANDED_TO_COURIER', 'Передано курьеру',    5, false),
-    (6, 'DELIVERED',         'Доставлено',          6, true);
-
--- 4.1. Контроль
---SELECT * FROM core.event_status ORDER BY status_id;
-
-
--- 5. Заполнение таблицы core.shipment
-INSERT INTO core.shipment (
-    shipment_id,
-    sender_person_id,
-    receiver_person_id,
-    courier_person_id,
-    route_id
-)
-SELECT
-    base.shipment_id,
-    base.sender_no,
-    base.receiver_no,
-    courier.courier_no,          -- NULL, если нет строки со status_seq = 5
-    base.route_id
-FROM (
-    -- 1) одна строка на shipment: sender, receiver, route
-    SELECT DISTINCT ON (s.shipment_id)
-        s.shipment_id,
-        s.sender_no,
-        s.receiver_no,
-        r.route_id
-    FROM core.stg_event_clean s
-    JOIN core.city sc ON sc.city_name = s.sender_city
-    JOIN core.city rc ON rc.city_name = s.receiver_city
-    JOIN core.route r  ON r.from_city_id = sc.city_id
-                      AND r.to_city_id   = rc.city_id
-    WHERE s.sender_no   IS NOT NULL
-      AND s.receiver_no IS NOT NULL
-    ORDER BY s.shipment_id, s.event_ts DESC
-) base
-LEFT JOIN (
-    -- 2) курьер только из события status_seq = 5
-    SELECT DISTINCT ON (s.shipment_id)
-        s.shipment_id,
-        s.courier_no
-    FROM core.stg_event_clean s
-    WHERE s.status_code = 'HANDED_TO_COURIER'
-      AND s.courier_no IS NOT NULL
-    ORDER BY s.shipment_id, s.event_ts DESC
-) courier
-  ON courier.shipment_id = base.shipment_id
-ON CONFLICT (shipment_id) DO NOTHING;
- 
--- Контроль
---SELECT sh.shipment_id,
---       sp.last_name || ' ' || sp.first_name AS sender,
---       rp.last_name || ' ' || rp.first_name AS receiver,
---       cp.last_name || ' ' || cp.first_name AS courier,
---       fc.city_name AS from_city,
---       tc.city_name AS to_city
---FROM core.shipment sh
---JOIN core.person sp ON sp.person_id = sh.sender_person_id
---JOIN core.person rp ON rp.person_id = sh.receiver_person_id
---LEFT JOIN core.person cp ON cp.person_id = sh.courier_person_id
---JOIN core.route r ON r.route_id = sh.route_id
---JOIN core.city fc ON fc.city_id = r.from_city_id
---JOIN core.city tc ON tc.city_id = r.to_city_id
---ORDER BY sh.shipment_id;
-
--- 6. Заполнение таблицы core.shipment_event
-INSERT INTO core.shipment_event (
-    event_id,
-    shipment_id,
-    event_datetime,
-    status_id,
-    raw_hash
-)
-SELECT
-    (COALESCE((SELECT MAX(event_id) FROM core.shipment_event), 0)
-     + ROW_NUMBER() OVER (ORDER BY s.event_ts, s.shipment_id))::BIGINT AS event_id,
-    s.shipment_id,
-    s.event_ts,
-    s.status_seq::SMALLINT,
-    s.raw_row_id                                       -- CHAR(34), 'hash:N' как есть
-FROM core.stg_event_clean s
-WHERE s.outcome = 'LOAD'
-  AND s.is_exact_duplicate = false
-  AND s.event_ts   IS NOT NULL
-  AND s.status_seq IS NOT NULL
-  AND EXISTS (SELECT 1 FROM core.shipment     sh WHERE sh.shipment_id = s.shipment_id)
-  AND EXISTS (SELECT 1 FROM core.event_status es WHERE es.status_id   = s.status_seq)
-  AND EXISTS (SELECT 1 FROM core.stg_raw_row  rr WHERE rr.raw_row_id = s.raw_row_id)
-ON CONFLICT (shipment_id, event_datetime, status_id) DO NOTHING;
-
--- Контроль
---SELECT COUNT(*) AS loaded_events FROM core.shipment_event;
-
+    -- Флаги посылок
+    INSERT INTO core.shipment_quality_flag (shipment_id, flag_code)
+    SELECT DISTINCT e.shipment_id, f.flag
+      FROM core.stg_event_clean e
+      JOIN core.shipment sh ON sh.shipment_id = e.shipment_id
+     CROSS JOIN LATERAL unnest(e.flags) AS f(flag)
+      JOIN core.ref_quality_flag q ON q.flag_code = f.flag AND q.flag_level = 'SHIPMENT'
+     WHERE e.outcome = 'LOAD'
+    UNION
+    SELECT sh.shipment_id, 'NO_COURIER'
+      FROM core.shipment sh
+     WHERE sh.courier_person_id IS NULL
+    UNION
+    SELECT ev.shipment_id, 'INCOMPLETE_CHAIN'
+      FROM core.shipment_event ev
+      JOIN core.event_status st ON st.status_id = ev.status_id AND NOT st.is_terminal
+     GROUP BY ev.shipment_id
+    HAVING count(DISTINCT ev.status_id) < (SELECT count(*) FROM core.event_status WHERE NOT is_terminal);
 END;
 $$;

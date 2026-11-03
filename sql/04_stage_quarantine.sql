@@ -2,18 +2,21 @@
 -- Этапы 5–6. Снимок RAW, очищенные события, карантин, итог по каждой строке RAW
 -- Команда 06 · «Доставка посылок»
 --
--- Порядок запуска:
---   fn_build_refs()          — справочники городов и людей из RAW (01_parse_functions.sql)
---   step_02_stage_raw()      — снимок RAW со стабильным raw_row_id, точные дубли
---   step_04_clean_events()   — разбор полей + проверки на уровне записи → issues / flags / outcome
---   step_05_quarantine()     — карантин (upsert, ручная обработка сохраняется) + итог по строкам RAW
---   run_stage_5_6()          — всё по порядку
+-- Шаги (запуск — core.run_pipeline()):
+--   step_02_stage_raw()    — снимок RAW
+--   step_03_clean_events() — разбор полей
+--   step_04_quarantine()   — карантин и итог строк
 --
 -- Категории итога не пересекаются, приоритет: DUPLICATE → QUARANTINE → LOAD.
 -- LOAD — строка корректна и загружается в core этапом 7.
 -- =====================================================================
 
 SET search_path = core, public;
+
+-- Старые имена шагов
+DROP FUNCTION IF EXISTS core.run_stage_5_6();
+DROP FUNCTION IF EXISTS core.step_04_clean_events();
+DROP FUNCTION IF EXISTS core.step_05_quarantine();
 
 -- ---------------------------------------------------------------------
 -- Настройки
@@ -39,8 +42,10 @@ CREATE TABLE IF NOT EXISTS ref_quarantine_reason (
     description   text NOT NULL,
     manual_action text NOT NULL
 );
-TRUNCATE ref_quarantine_reason;
-INSERT INTO ref_quarantine_reason VALUES
+-- Загрузка через временную таблицу: upsert вместо TRUNCATE (на справочник ссылается quarantine)
+DROP TABLE IF EXISTS tmp_reason;
+CREATE TEMP TABLE tmp_reason (LIKE ref_quarantine_reason);
+INSERT INTO tmp_reason VALUES
     ('ID_EMPTY',                  10, 'Нет идентификатора посылки',                         'Найти посылку по участникам и времени'),
     ('ID_INVALID',                11, 'Идентификатор посылки не по формату PKG-NNNNNN',      'Уточнить номер посылки'),
     ('EVENT_KEY_CONFLICT',        15, 'Одно событие (посылка, время, статус) с разными данными', 'Выбрать верную запись'),
@@ -64,7 +69,7 @@ INSERT INTO ref_quarantine_reason VALUES
     ('ROUTE_CITY_UNKNOWN',        42, 'Город маршрута не из справочника',                    'Сопоставить город'),
     ('ROUTE_MISMATCH',            43, 'Маршрут не совпадает с городами участников',          'Разобрать противоречие');
 -- причины по участникам: SENDER_*, RECEIVER_*, COURIER_*
-INSERT INTO ref_quarantine_reason
+INSERT INTO tmp_reason
 SELECT r.prefix || '_' || e.code, r.base + e.shift, r.who || ': ' || e.descr, e.action
   FROM (VALUES ('SENDER', 50, 'Отправитель'), ('RECEIVER', 60, 'Получатель'), ('COURIER', 70, 'Курьер')) r(prefix, base, who)
  CROSS JOIN (VALUES
@@ -79,6 +84,24 @@ SELECT r.prefix || '_' || e.code, r.base + e.shift, r.who || ': ' || e.descr, e.
     ('CITY_MISMATCH', 8, 'город не совпадает с городом человека',            'Проверить человека и город')
  ) e(code, shift, descr, action)
  WHERE NOT (r.prefix = 'COURIER' AND e.code LIKE 'CITY%');
+
+INSERT INTO ref_quarantine_reason
+SELECT * FROM tmp_reason
+ON CONFLICT (reason_code) DO UPDATE
+   SET priority = EXCLUDED.priority, description = EXCLUDED.description, manual_action = EXCLUDED.manual_action;
+-- Убранные из списка причины (если на них никто не ссылается)
+DO $$
+BEGIN
+    IF to_regclass('core.quarantine') IS NULL THEN
+        DELETE FROM core.ref_quarantine_reason r
+         WHERE NOT EXISTS (SELECT 1 FROM tmp_reason t WHERE t.reason_code = r.reason_code);
+    ELSE
+        DELETE FROM core.ref_quarantine_reason r
+         WHERE NOT EXISTS (SELECT 1 FROM tmp_reason t WHERE t.reason_code = r.reason_code)
+           AND NOT EXISTS (SELECT 1 FROM core.quarantine q WHERE q.primary_reason = r.reason_code);
+    END IF;
+END $$;
+DROP TABLE tmp_reason;
 
 -- ---------------------------------------------------------------------
 -- Хеш строки RAW: md5 от записи из 7 полей (NULL и '' различаются)
@@ -117,7 +140,8 @@ CREATE OR REPLACE FUNCTION step_02_stage_raw()
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE n int;
 BEGIN
-    TRUNCATE core.stg_event_clean, core.stg_raw_row;
+    -- CASCADE: на stg_raw_row ссылается shipment_event (FK14)
+    TRUNCATE core.stg_event_clean, core.stg_raw_row CASCADE;
     INSERT INTO core.stg_raw_row
     SELECT raw_hash || ':' || occurrence, raw_hash, occurrence, occurrence > 1,
            shipment_id, event_datetime, sender_info, receiver_info, route_info, courier_info, status_info
@@ -155,7 +179,15 @@ CREATE TABLE IF NOT EXISTS stg_event_clean (
     outcome            text CHECK (outcome IN ('LOAD', 'QUARANTINE', 'DUPLICATE'))
 );
 
-CREATE OR REPLACE FUNCTION step_04_clean_events()
+-- FK: статус из справочника
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'core.stg_event_clean'::regclass AND conname = 'stg_event_clean_status_fk') THEN
+        ALTER TABLE core.stg_event_clean ADD CONSTRAINT stg_event_clean_status_fk FOREIGN KEY (status_code) REFERENCES core.ref_status (status_code);
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION step_03_clean_events()
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     v_from date := (SELECT value::date FROM core.ref_setting WHERE name = 'period_from');
@@ -345,7 +377,23 @@ CREATE TABLE IF NOT EXISTS raw_row_outcome (
     detail     text
 );
 
-CREATE OR REPLACE FUNCTION step_05_quarantine()
+-- FK: причина карантина из справочника
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'core.quarantine'::regclass AND conname = 'quarantine_reason_fk') THEN
+        ALTER TABLE core.quarantine ADD CONSTRAINT quarantine_reason_fk FOREIGN KEY (primary_reason) REFERENCES core.ref_quarantine_reason (reason_code);
+    END IF;
+END $$;
+
+-- FK: итог относится к строке снимка RAW
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'core.raw_row_outcome'::regclass AND conname = 'raw_row_outcome_raw_row_fk') THEN
+        ALTER TABLE core.raw_row_outcome ADD CONSTRAINT raw_row_outcome_raw_row_fk FOREIGN KEY (raw_row_id) REFERENCES core.stg_raw_row (raw_row_id);
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION step_04_quarantine()
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
     v_step interval := (SELECT value::interval FROM core.ref_setting WHERE name = 'event_step');
@@ -509,15 +557,4 @@ SELECT q.primary_reason, r.description, count(*) AS rows,
  GROUP BY q.primary_reason, r.description, r.priority
  ORDER BY r.priority;
 
--- ---------------------------------------------------------------------
--- Запуск этапов 5–6 целиком
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION run_stage_5_6(
-    OUT cities int, OUT persons int, OUT raw_rows int, OUT clean_rows int, OUT quarantined int)
-LANGUAGE plpgsql AS $$
-BEGIN
-    SELECT b.cities, b.persons INTO cities, persons FROM core.fn_build_refs() b;
-    raw_rows    := core.step_02_stage_raw();
-    clean_rows  := core.step_04_clean_events();
-    quarantined := core.step_05_quarantine();
-END $$;
+-- Оркестратор — sql/run_pipeline.sql

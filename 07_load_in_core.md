@@ -1,259 +1,152 @@
-# Этапы 07 - 08. Загрузка данных в Core  
+# Этап 7. Загрузка данных в core
 
-**Команда 06 · «Доставка посылок»** 
+**Команда 06 · «Доставка посылок»**
 
-Этап 7.	Загрузить корректные данные в core. Повторный запуск pipeline должен быть идемпотентным: при неизменном RAW итоговые таблицы и показатели не изменяются, дубли не появляются.
-Этап 8.	Добавить проверки качества данных и контроль результатов загрузки.
+> Этап 7. Загрузить корректные данные в core. Повторный запуск pipeline должен быть идемпотентным:
+> при неизменном RAW итоговые таблицы и показатели не изменяются, дубли не появляются.
 
+## 1. Развёртывание и запуск
 
-## 1. Развёртывание и запуск (все объекты — в схеме `core`):
+Все объекты — в схеме `core`. RAW (`public.raw_data_06`) только читается.
+
+```sql
+\i deploy.sql                         -- все объекты решения, можно запускать повторно
+SELECT * FROM core.run_pipeline();    -- первый запуск
+SELECT * FROM core.run_pipeline();    -- второй запуск
+SELECT * FROM core.v_run_comparison;  -- сравнение двух запусков (см. 08_проверки_качества.md)
+```
+
+Порядок файлов в `deploy.sql`:
 
 | Файл | Что внутри |
 | :--- | :--- |
-| `sql/06_load_in_core.sql` | Процедура загрузки данных в core схему из созданной на предыдущем этапе таблицы core.stg_event_clean  |
+| `sql/01_parse_functions.sql` | справочники, функции разбора, `fn_build_refs()` |
+| `sql/04_stage_quarantine.sql` | шаги 02–04: снимок RAW, очистка, карантин, итог строк RAW |
+| `Task3.sql` | таблицы core (этапы 3–4) |
+| `sql/check_core_table.sql` | `core.check_core_counts()` — сверка количеств core |
+| `sql/06_load_in_core.sql` | шаг 05: загрузка core, справочник флагов `ref_quality_flag` |
+| `sql/07_marts.sql` | шаг 06: витрины |
+| `sql/08_quality_control.sql` | шаг 07: проверки качества, журнал запусков, представления контроля |
+| `sql/09_mart_queries.sql` | контрольные запросы к витринам `core.v_q01…v_q10` |
+| `sql/run_pipeline.sql` | шаг 01 и оркестратор `core.run_pipeline()` |
 
+## 2. Оркестратор `core.run_pipeline()`
 
-**Создание процедуры** 
+Одна функция запускает шаги строго по порядку 01 → 07 в одной транзакции и возвращает журнал шагов.
 
-```sql
-CREATE OR REPLACE PROCEDURE core.step_06_load_in_core()
-LANGUAGE plpgsql
-SET search_path = core, public
-AS $$
-BEGIN
+| Шаг | Функция / процедура | Что делает |
+| :---: | :--- | :--- |
+| 01 | `core.step_01_build_refs()` | справочники городов и людей из RAW |
+| 02 | `core.step_02_stage_raw()` | снимок RAW со стабильным `raw_row_id`, точные дубли |
+| 03 | `core.step_03_clean_events()` | разбор полей, причины карантина, флаги, итог строки |
+| 04 | `core.step_04_quarantine()` | карантин (upsert с сохранением ручной обработки) + итог по каждой строке RAW |
+| 05 | `core.step_05_load_core()` | загрузка core из строк с итогом LOAD |
+| 06 | `core.step_06_build_marts()` | витрины `core.mart_*` |
+| 07 | `core.step_07_quality_checks(run_id)` | проверки качества и контрольные показатели запуска |
 
--- 0. Очистка перед загрузкой
-TRUNCATE TABLE core.city RESTART identity CASCADE;
-TRUNCATE TABLE core.person RESTART identity CASCADE;
-TRUNCATE TABLE core.route RESTART identity CASCADE;
-TRUNCATE TABLE core.shipment RESTART identity CASCADE;
-TRUNCATE TABLE core.event_status RESTART identity CASCADE;
-TRUNCATE TABLE core.shipment_event RESTART identity CASCADE;
+* `pg_advisory_xact_lock` — два запуска одновременно не пойдут.
+* Ошибка любого шага откатывает весь запуск: core не остаётся заполненным наполовину.
+* Если не пройдена проверка уровня ERROR, данные сохраняются, а запуск получает статус `CHECKS_FAILED`.
+* Каждый запуск пишется в `core.etl_run_log`, время шагов — в `core.run_step_log`.
 
--- 1. Загрузка в core.city
---    city_id генерируется по порядку: 1, 2, 3, ...
---    Порядок задаём по city_norm (файл уже отсортирован по нему),
---    чтобы нумерация была воспроизводимой.
-INSERT INTO core.city (city_id, city_name)
-SELECT
-    ROW_NUMBER() OVER (ORDER BY s.city_norm)::SMALLINT AS city_id,
-    s.city_name
-FROM core.ref_city s
--- защита от повторной загрузки, если city_name уже есть
-WHERE NOT EXISTS (
-    SELECT 1 FROM core.city c WHERE c.city_name = s.city_name
-);
+Результат запуска:
 
--- 2. Загрузка в core.person
-INSERT INTO core.person (
-    person_id,
-    person_code,
-    last_name,
-    first_name,
-    patronymic,
-    city_id
-)
-SELECT
-    s.person_no                         AS person_id,
-    LPAD(s.person_no::text, 3, '0')     AS person_code,  -- CHAR(3), например '001'
-    s.last_name,
-    s.first_name,
-    NULLIF(s.patronymic, '')            AS patronymic,   -- пустая строка -> NULL
-    c.city_id
-FROM core.ref_person s
-JOIN core.city c
-  ON c.city_name = s.city_name;
+| step_no | step_name | result | seconds |
+| :---: | :--- | :--- | ---: |
+| 1 | step_01_build_refs | городов 8, людей 20, замечаний 0 | 1.8 |
+| 2 | step_02_stage_raw | строк RAW 10178 | 0.1 |
+| 3 | step_03_clean_events | разобрано строк 10178 | 7.7 |
+| 4 | step_04_quarantine | в карантине 1273 | 0.2 |
+| 5 | step_05_load_core | посылок 2000, событий 8727 | 0.2 |
+| 6 | step_06_build_marts | mart_shipment 2000 строк | 0.1 |
+| 7 | step_07_quality_checks | ERROR не пройдено 0, WARNING 3 | 0.3 |
 
+## 3. Правила загрузки (`core.step_05_load_core()`)
 
--- 3. Загрузка в core.route
-INSERT INTO core.route (route_id, from_city_id, to_city_id)
-SELECT
-    (COALESCE((SELECT MAX(route_id) FROM core.route), 0)
-     + ROW_NUMBER() OVER (ORDER BY fc.city_id, tc.city_id))::INT AS route_id,
-    fc.city_id AS from_city_id,
-    tc.city_id AS to_city_id
-FROM (
-    SELECT DISTINCT route_from, route_to
-    FROM core.stg_event_clean
-    WHERE route_from IS NOT NULL
-      AND route_to   IS NOT NULL
-) s
-JOIN core.city fc ON fc.city_name = s.route_from
-JOIN core.city tc ON tc.city_name = s.route_to
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM core.route r
-    WHERE r.from_city_id = fc.city_id
-      AND r.to_city_id   = tc.city_id
-);
+Источник — только строки `core.stg_event_clean` с итогом `LOAD`. Строки QUARANTINE и DUPLICATE в core не попадают.
 
--- 4. Заполнение таблицы core.event_status
-INSERT INTO core.event_status (status_id, status_code, status_name, seq_no, is_terminal)
-VALUES
-    (1, 'CREATED',           'Создано',             1, false),
-    (2, 'ACCEPTED',          'Принято',             2, false),
-    (3, 'SORTING',           'Сортировочный центр', 3, false),
-    (4, 'IN_TRANSIT',        'В пути',              4, false),
-    (5, 'HANDED_TO_COURIER', 'Передано курьеру',    5, false),
-    (6, 'DELIVERED',         'Доставлено',          6, true);
-
--- 5. Заполнение таблицы core.shipment
-INSERT INTO core.shipment (
-    shipment_id,
-    sender_person_id,
-    receiver_person_id,
-    courier_person_id,
-    route_id
-)
-SELECT
-    base.shipment_id,
-    base.sender_no,
-    base.receiver_no,
-    courier.courier_no,          -- NULL, если нет строки со status_seq = 5
-    base.route_id
-FROM (
-    -- 1) одна строка на shipment: sender, receiver, route
-    SELECT DISTINCT ON (s.shipment_id)
-        s.shipment_id,
-        s.sender_no,
-        s.receiver_no,
-        r.route_id
-    FROM core.stg_event_clean s
-    JOIN core.city sc ON sc.city_name = s.sender_city
-    JOIN core.city rc ON rc.city_name = s.receiver_city
-    JOIN core.route r  ON r.from_city_id = sc.city_id
-                      AND r.to_city_id   = rc.city_id
-    WHERE s.sender_no   IS NOT NULL
-      AND s.receiver_no IS NOT NULL
-    ORDER BY s.shipment_id, s.event_ts DESC
-) base
-LEFT JOIN (
-    -- 2) курьер только из события status_seq = 5
-    SELECT DISTINCT ON (s.shipment_id)
-        s.shipment_id,
-        s.courier_no
-    FROM core.stg_event_clean s
-    WHERE s.status_code = 'HANDED_TO_COURIER'
-      AND s.courier_no IS NOT NULL
-    ORDER BY s.shipment_id, s.event_ts DESC
-) courier
-  ON courier.shipment_id = base.shipment_id
-ON CONFLICT (shipment_id) DO NOTHING;
- 
--- 6. Заполнение таблицы core.shipment_event
-INSERT INTO core.shipment_event (
-    event_id,
-    shipment_id,
-    event_datetime,
-    status_id,
-    raw_hash
-)
-SELECT
-    (COALESCE((SELECT MAX(event_id) FROM core.shipment_event), 0)
-     + ROW_NUMBER() OVER (ORDER BY s.event_ts, s.shipment_id))::BIGINT AS event_id,
-    s.shipment_id,
-    s.event_ts,
-    s.status_seq::SMALLINT,
-    s.raw_row_id                                       -- CHAR(34), 'hash:N' как есть
-FROM core.stg_event_clean s
-WHERE s.outcome = 'LOAD'
-  AND s.is_exact_duplicate = false
-  AND s.event_ts   IS NOT NULL
-  AND s.status_seq IS NOT NULL
-  AND EXISTS (SELECT 1 FROM core.shipment     sh WHERE sh.shipment_id = s.shipment_id)
-  AND EXISTS (SELECT 1 FROM core.event_status es WHERE es.status_id   = s.status_seq)
-  AND EXISTS (SELECT 1 FROM core.stg_raw_row  rr WHERE rr.raw_row_id = s.raw_row_id)
-ON CONFLICT (shipment_id, event_datetime, status_id) DO NOTHING;
-
-
-END;
-$$;                        
-```
-**Запуск процедуры** 
-
-```sql
-BEGIN;
-CALL core.step_06_load_in_core();
-SELECT COUNT(*) AS loaded_events FROM core.shipment_event;
-
-COMMIT;                          
-```
-
-
-## 2. Pipeline
-
-Добавлена функция core.run_pipeline() по последовательному запуску шагов
-
-| Шаг | Функция\Процедура | Что делает |
+| Таблица | Откуда | Ключ |
 | :--- | :--- | :--- |
-| 1 | `core.step_02_stage_raw()` | снимок RAW со стабильным `raw_row_id`, точные дубли |
-| 2 | `core.step_04_clean_events()` | разбор полей, проверки уровня записи и посылки, итог строки |
-| 3 | `core.step_05_quarantine()` | карантин и итог по каждой строке RAW |
-| 1 | `core.step_06_load_in_core` | Записывает даныне в целевые таблицы |
+| `event_status` | справочник `core.ref_status` | `status_id = seq_no` (1…6), `is_terminal` — последний этап |
+| `city` | справочник `core.ref_city` | номер по `city_norm` |
+| `person` | справочник `core.ref_person` | `person_id` = номер из кодов S/R/C##; `person_code` = `'001'…'020'` (номера ≥ 1000 не обрезаются); ФИО в обычном написании (`initcap`), в справочнике — нижний регистр для сравнения |
+| `route` | пары `route_from → route_to` строк LOAD | номер по (город отправления, город назначения) |
+| `shipment` | строки LOAD, сгруппированные по посылке | `shipment_id` (`PKG-NNNNNN`) |
+| `shipment_event` | каждая строка LOAD = одно событие | `event_id` — номер по (посылка, время, этап); `raw_hash` = `raw_row_id`, UNIQUE |
+| `event_quality_flag` | флаги строки уровня EVENT | (событие, флаг) |
+| `shipment_quality_flag` | флаги уровня SHIPMENT + вычисленные по посылке | (посылка, флаг) |
 
-```sql
---SELECT * FROM core.run_pipeline();
+**Участники посылки.** Отправитель, получатель, курьер и маршрут внутри посылки согласованы: противоречия уже отправлены
+в карантин на этапе 5 (`SHIPMENT_PARTY_CONFLICT`, `SHIPMENT_COURIER_CONFLICT`, `ROUTE_MISMATCH`). Поэтому для посылки берётся
+единственное непустое значение из её строк LOAD. Курьер берётся из **любого** загружаемого события, где он указан, а не только
+из «Передано курьеру»: в 110 таких событиях курьер пуст (флаг `COURIER_MISSING_ON_HANDOVER`), но указан в других строках посылки.
+Итог — без курьера **66** посылок, а не 171. Согласованность проверяет `SHIPMENT_PARTY_INCONSISTENT` (этап 8).
 
-CREATE OR REPLACE FUNCTION core.run_pipeline(
-    OUT raw_rows    integer,
-    OUT clean_rows  integer,
-    OUT quarantined integer
-)
-RETURNS record
-LANGUAGE plpgsql
-AS $function$
-BEGIN
-    -- Не допускаем параллельных запусков пайплайна
-    PERFORM pg_advisory_xact_lock(8, 2026);
+**Нет молчаливых потерь.** Если посылку собрать нельзя (ни в одной строке LOAD нет отправителя или получателя), её события
+не исчезают незаметно: проверка `LOAD_ROW_NOT_IN_CORE` даёт ошибку, и запуск получает статус `CHECKS_FAILED`. На текущих данных таких строк 0.
 
-    raw_rows    := core.step_02_stage_raw();
-    clean_rows  := core.step_04_clean_events();
-    quarantined := core.step_05_quarantine();
-    CALL core.step_06_load_in_core();
-END;
-$function$
-;
+**Флаги качества** (справочник `core.ref_quality_flag`):
 
-```
+| Флаг | Уровень | Источник | Кол-во |
+| :--- | :--- | :--- | ---: |
+| `SENDER_EMPTY` | событие | этап 5 | 528 |
+| `RECEIVER_EMPTY` | событие | этап 5 | 542 |
+| `COURIER_MISSING_ON_HANDOVER` | событие | этап 5 | 110 |
+| `SELF_SHIPMENT` | посылка | этап 5 | 101 |
+| `SAME_CITY_DELIVERY` | посылка | этап 5 | 270 |
+| `NO_COURIER` | посылка | core | 66 |
+| `INCOMPLETE_CHAIN` | посылка | core | 974 |
 
+«Доставлено» в RAW встречается только как ошибочная метка вместо базового этапа (карантин `STATUS_MISLABELED`),
+поэтому полнота цепочки считается по пяти базовым этапам «Создано» … «Передано курьеру».
 
-## Проверка результата
+## 4. Идемпотентность
 
-| Показатель | Значение |
+* Шаги 02–06 полностью пересобирают свои таблицы (`TRUNCATE` + `INSERT`) в одной транзакции.
+* Все ключи детерминированы: из справочников или `row_number()` по естественному ключу, без `MAX(id) + 1` и последовательностей.
+* Карантин — upsert по `raw_row_id`: статус ручной обработки (`resolution_status`, `resolution_comment`) сохраняется между запусками.
+* `shipment_event.raw_hash` UNIQUE и `UNIQUE (shipment_id, event_datetime, status_id)` — повтор события невозможен.
+
+Проверено: два запуска подряд дают одинаковые значения всех 47 контрольных показателей (количества, суммы, md5 таблиц),
+см. `08_проверки_качества.md`. Тот же результат получен на чистой БД, где есть только RAW.
+
+## 5. Результат
+
+| Таблица core | Строк |
 | :--- | ---: |
-| Количество городов в core.city | **8** |
-| shipment_event | **8 727** |
-| Уникальных ФИО (core.person) | **20** |
-| Уникальных маршрута (core.route) | **64** |
-| core.event_status | **6** |
-| Уникальных отправлений (core.shipment) | **2000** |
+| `city` | 8 |
+| `person` | 20 |
+| `route` | 64 |
+| `event_status` | 6 |
+| `shipment` | 2 000 |
+| `shipment_event` | 8 727 |
+| `event_quality_flag` | 1 180 |
+| `shipment_quality_flag` | 1 411 |
 
+`core.check_core_counts()`:
 
-```sql
-select 'city', COUNT(*) FROM core.city
-UNION ALL
-select 'person', COUNT(*) FROM core.person
-UNION ALL
-select 'route', COUNT(*) FROM core.route
-UNION ALL
-select 'shipment', COUNT(*) FROM core.shipment
-UNION ALL
-select 'shipment_event', COUNT(*) FROM core.shipment_event;
-```
+| pair | core_cnt | ref_cnt | is_equal |
+| :--- | ---: | ---: | :---: |
+| core.city vs ref_city | 8 | 8 | true |
+| core.person vs ref_person | 20 | 20 | true |
+| core.shipment vs raw_data_06 (unique shipment_id) | 2000 | 2000 | true |
+| core.route vs raw_data_06 (unique route combinations) | 64 | 64 | true |
+| core.shipment_event vs raw_row_outcome (LOAD) | 8727 | 8727 | true |
 
-Функция core.check_core_counts() сравнивает количество записанное в CORE с другими таблицами.
+## 6. Что исправлено относительно предыдущей версии
 
-| pair | core_count | ref\raw_count | equal |
-| --- | --- | --- | --- |
-|core.city vs ref_city|	8|	8|	true|
-|core.person vs ref_person|	20|	20|	true|
-|core.shipment vs raw_data_06 (unique shipment_id)|	2000|	2000|	true|
-|core.route vs raw_data_06 (unique route combinations)|	64|	64|	true|
-|core.shipment_event vs raw_row_outcome (LOAD)|	8727|	8727|	true|
-
-## Прочее
-
-В core.shipment.shipment_id и core.shipment_event.shipment_id 
-Тип изменен на CHAR(10)
-Количество символов в номер отправления (PKG-XXXXXX) - 10
-
+| Было | Стало |
+| :--- | :--- |
+| `run_pipeline()` падал на первом шаге: `TRUNCATE core.stg_raw_row` запрещён, пока на неё ссылается `shipment_event` (FK14) | `step_02_stage_raw()` очищает staging с `CASCADE`; core всё равно пересобирается шагом 05 |
+| Шаги 02, 04, 05, 06 + отдельно `fn_build_refs()` и `run_stage_5_6()` | Шаги 01 → 07 подряд, один оркестратор; старые имена удалены |
+| Справочники в пайплайне не пересобирались | Шаг 01 `step_01_build_refs()` |
+| Статусы вписаны вручную в `VALUES` | Из `core.ref_status` |
+| ФИО в нижнем регистре (`орлов елена`) | `Орлов Елена Ивановна` |
+| `person_code` через `LPAD(…, 3)` — для номеров ≥ 1000 обрезается и даёт дубли | Длина не меньше 3, без обрезки |
+| Курьер только из «Передано курьеру» — 171 посылка без курьера | Из любого события посылки — 66 |
+| Посылки из всех строк stg (включая карантин); события отфильтровывались `EXISTS` молча | Только строки LOAD; потеря строки LOAD — ошибка проверки |
+| `event_id = MAX + row_number()` | `row_number()` по естественному ключу |
+| Флаги качества не загружались | `event_quality_flag`, `shipment_quality_flag` + справочник `ref_quality_flag`, FK `flag_code` → `ref_quality_flag` |
+| Служебные таблицы без FK | FK `stg_event_clean` → `ref_status`, `quarantine` → `ref_quarantine_reason`, `raw_row_outcome` → `stg_raw_row`; справочник причин — upsert вместо `TRUNCATE` |
+| Нет журнала, проверок, витрин | Этапы 8–10, см. `08_…`, `09_…`, `10_…` |
+| `Task3.sql` падал на пустой БД и при повторном запуске | `CREATE TABLE IF NOT EXISTS`, порядок развёртывания в `deploy.sql`, UNIQUE (K9) на `raw_hash` |
