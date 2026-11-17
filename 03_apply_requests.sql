@@ -37,16 +37,29 @@ BEGIN
             END IF;
 
         ELSIF r.operation_type = 'UPDATE' THEN
-            UPDATE nsi.shipment_status
-            SET code = COALESCE(r.new_code, code),
-                name = COALESCE(r.new_name, name),
-                updated_at = now()
-            WHERE status_id = r.status_id;
+            IF r.new_code IS NOT NULL AND EXISTS (
+                SELECT 1
+                FROM nsi.shipment_status
+                WHERE code = r.new_code
+                  AND status_id <> r.status_id
+            ) THEN
+                UPDATE nsi.change_request
+                SET is_applied = true,
+                    applied_at = now(),
+                    comment = COALESCE(comment || '; ', '') || 'Не применена: код уже существует'
+                WHERE request_id = r.request_id;
+            ELSE
+                UPDATE nsi.shipment_status
+                SET code = COALESCE(r.new_code, code),
+                    name = COALESCE(r.new_name, name),
+                    updated_at = now()
+                WHERE status_id = r.status_id;
 
-            UPDATE nsi.change_request
-            SET is_applied = true,
-                applied_at = now()
-            WHERE request_id = r.request_id;
+                UPDATE nsi.change_request
+                SET is_applied = true,
+                    applied_at = now()
+                WHERE request_id = r.request_id;
+            END IF;
 
         ELSIF r.operation_type = 'DELETE' THEN
             UPDATE nsi.shipment_status

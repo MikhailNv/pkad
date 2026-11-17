@@ -78,3 +78,15 @@ SELECT request_id, operation_type, status_id, new_name, request_status, is_appli
 FROM nsi.change_request
 WHERE request_status = 'REJECTED'
 ORDER BY request_id;
+
+SELECT '10. Проверка запрета физического удаления' AS step;
+
+DELETE FROM nsi.shipment_status
+WHERE code = 'SORTING';
+
+DELETE FROM nsi.change_request
+WHERE request_status = 'REJECTED';
+
+SELECT
+    (SELECT count(*) FROM nsi.shipment_status) AS status_rows,
+    (SELECT count(*) FROM nsi.change_request) AS request_rows;

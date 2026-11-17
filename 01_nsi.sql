@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS nsi.change_request (
 CREATE INDEX IF NOT EXISTS idx_change_request_apply
     ON nsi.change_request (request_status, is_applied);
 
+CREATE OR REPLACE RULE rl_shipment_status_no_delete AS
+    ON DELETE TO nsi.shipment_status
+    DO INSTEAD NOTHING;
+
+CREATE OR REPLACE RULE rl_change_request_no_delete AS
+    ON DELETE TO nsi.change_request
+    DO INSTEAD NOTHING;
+
 INSERT INTO nsi.shipment_status (code, name, is_active, valid_from, valid_to)
 VALUES
     ('CREATED', 'Создано', true, DATE '2026-01-01', NULL),
